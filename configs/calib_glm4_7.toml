@@ -1,0 +1,9 @@
+# Calibration datasets for GLM-4.7.
+
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 4096
+
+[[dataset]]
+path = "text/deep_calib.jsonl"
+max_len = 4096

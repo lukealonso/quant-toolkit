@@ -2,6 +2,7 @@
 
 Supports:
   - MiniMaxM2 (built-in transformers): MiniMaxM2Experts
+  - GLM-4 MoE (glm4_moe): Glm4MoeMoE + Glm4MoeNaiveMoe
   - GLM-5 / glm_moe_dsa (remote code): GlmMoeDsaMoE + GlmMoeDsaNaiveMoe
   - Qwen3.5 MoE: Qwen3_5MoeSparseMoeBlock + Qwen3_5MoeExperts
 
@@ -117,6 +118,43 @@ class _QuantFusedExperts(QuantModule):
                 0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
             )
         return final_hidden_states
+
+
+# ---------------------------------------------------------------------------
+# GLM-4 MoE (glm4_moe).
+# ---------------------------------------------------------------------------
+
+class _QuantGlm4MoeMoE(_QuantSparseMoe):
+    @property
+    def num_experts(self):
+        return self.n_routed_experts
+
+    def forward(self, hidden_states):
+        return super(_QuantSparseMoe, self).forward(hidden_states)
+
+
+def register_glm4_7_moe_for_quantization():
+    """Register GLM-4 MoE (glm4_moe) classes with modelopt."""
+    try:
+        from transformers.models.glm4_moe.modeling_glm4_moe import (
+            Glm4MoeMoE,
+            Glm4MoeNaiveMoe,
+        )
+    except ImportError:
+        print("⚠ glm4_moe not in transformers, skipping GLM-4 registration")
+        return
+
+    if QuantModuleRegistry.get(Glm4MoeMoE) is None:
+        QuantModuleRegistry.register(
+            {Glm4MoeMoE: "Glm4MoeMoE"}
+        )(_QuantGlm4MoeMoE)
+
+    if QuantModuleRegistry.get(Glm4MoeNaiveMoe) is None:
+        QuantModuleRegistry.register(
+            {Glm4MoeNaiveMoe: "Glm4MoeNaiveMoe"}
+        )(_QuantFusedExperts)
+
+    print("✓ Registered GLM-4 MoE for quantization")
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,8 @@ parser.add_argument("--resume-amax", type=str, default=None,
                     help="Load amax checkpoint and resume calibration from where it left off.")
 parser.add_argument("--resume-batch", type=int, default=0,
                     help="Skip batches before this number (1-indexed). Use with --resume-amax.")
+parser.add_argument("--microbatch", type=int, default=None,
+                    help="Split calibration batches into microbatches of this size to limit GPU 0 activation memory.")
 parser.add_argument("--calib-method", default="max", choices=["max", "quantile"],
                     help="Calibration algorithm. 'quantile' uses P2 streaming quantile estimation.")
 parser.add_argument("--save-quantiles", type=str, default=None,
