@@ -18,6 +18,7 @@ import modelopt.torch.quantization as mtq
 import logging
 
 from models import load_config, AVAILABLE_MODELS
+from quant_config_compat import compose_quant_config
 from models.mimo_v25_visual import (
     build_mimo_processor,
     precompute_mimo_visual_embeds_for_batches,
@@ -35,6 +36,7 @@ from models.mimo_v25_media import (
     video_audio_source,
     video_uses_audio,
 )
+from token_panel import build_token_panel_batches
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +69,14 @@ parser.add_argument("--save-amax", type=str, default=None,
                     help="Save calibration amax values to this safetensors file.")
 parser.add_argument("--skip-export", action="store_true",
                     help="Skip model export (amax-only calibration run).")
+parser.add_argument(
+    "--post-quant-smoke",
+    action="store_true",
+    help=(
+        "Calibrate weights without a model forward, then run exactly one configured batch "
+        "after quantization is finalized. Intended for dynamic-block NVFP4 streaming smoke tests."
+    ),
+)
 streaming_group = parser.add_mutually_exclusive_group()
 streaming_group.add_argument("--streaming", dest="streaming", action="store_true",
                              help="Force streaming loader. Default: use model config.")
@@ -181,6 +191,11 @@ if ATTN_IMPLEMENTATION is not None:
     print(f"Using attention implementation: {ATTN_IMPLEMENTATION}")
 
 cfg.register_moe()
+qcfg = compose_quant_config(
+    mtq.NVFP4_DEFAULT_CFG,
+    cfg.get_all_quant_overrides(),
+    calibration_method=args.calib_method,
+)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE)
 if tokenizer.pad_token is None:
@@ -796,7 +811,18 @@ def build_mm_batches(samples, max_len, batch_size):
 # Pre-build all batches, tagged with dataset index for logging.
 all_batches = []
 for ds_idx, ds in enumerate(calib_datasets):
-    if ds.get("multimodal", False):
+    if ds.get("format") == "token_panel":
+        role = ds.get("role")
+        if not role:
+            parser.error(f"token_panel dataset[{ds_idx}] requires a role")
+        ds_batches = build_token_panel_batches(
+            ds["path"],
+            role=role,
+            limit=ds.get("limit"),
+            max_len=ds.get("max_len"),
+            batch_size=ds["batch_size"],
+        )
+    elif ds.get("multimodal", False):
         ds_batches = list(build_mm_batches(
             iter_mm_samples(ds["path"], limit=ds.get("limit")),
             max_len=ds.get("max_len"),
@@ -898,6 +924,12 @@ _MINIMAX_M3_ALLOWED_QUANTIZER_RE = re.compile(
     r"(?:weight_quantizer|input_quantizer)$"
 )
 
+_GLM53_FLASH_ALLOWED_QUANTIZER_RE = re.compile(
+    r"^model\.language_model\.layers\.\d+\.mlp\.experts\."
+    r"(?:gate_proj|up_proj|down_proj)\.\d+\."
+    r"(?:weight_quantizer|input_quantizer)$"
+)
+
 def _validate_enabled_quantizers(m):
     allowed_re = None
     label = None
@@ -907,6 +939,9 @@ def _validate_enabled_quantizers(m):
     elif args.model == "minimax_m3":
         allowed_re = _MINIMAX_M3_ALLOWED_QUANTIZER_RE
         label = "MiniMax M3"
+    elif args.model == "glm5_3_flash":
+        allowed_re = _GLM53_FLASH_ALLOWED_QUANTIZER_RE
+        label = "GLM-5.3-Flash"
 
     if allowed_re is None:
         return
@@ -986,26 +1021,37 @@ def forward_loop(m):
     print("Calibration complete.")
 
 
+def post_quant_smoke(m):
+    if len(all_batches) != 1:
+        raise RuntimeError(
+            f"--post-quant-smoke requires exactly one configured batch, got {len(all_batches)}"
+        )
+    _validate_enabled_quantizers(m)
+    input_device = next(m.parameters()).device
+    _, batch = all_batches[0]
+    kwargs = {
+        key: value.to(input_device, non_blocking=True)
+        for key, value in batch.items()
+        if isinstance(value, torch.Tensor)
+    }
+    print("\nPost-quant smoke: 1 batch with finalized quantizers...")
+    with torch.no_grad():
+        outputs = m(**kwargs, use_cache=False)
+    del outputs, kwargs
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Post-quant smoke complete.")
+
+
 # ---------------------------------------------------------------------------
 # Quantize.
 # ---------------------------------------------------------------------------
 
-base_qcfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
-qcfg = copy.deepcopy(base_qcfg)
-for pattern, override in cfg.get_all_quant_overrides().items():
-    if override == {"enable": True}:
-        if pattern.endswith("weight_quantizer"):
-            override = copy.deepcopy(base_qcfg["quant_cfg"]["*weight_quantizer"])
-        elif pattern.endswith("input_quantizer"):
-            override = copy.deepcopy(base_qcfg["quant_cfg"]["*input_quantizer"])
-    qcfg["quant_cfg"][pattern] = override
-
-if args.calib_method == "quantile":
-    qcfg["algorithm"] = "quantile"
-    qcfg["quant_cfg"]["*input_quantizer"]["calibrator"] = "quantile"
-
 print(f"\nQuantizing with NVFP4 (model={args.model}, calib={args.calib_method})...")
-model = mtq.quantize(model, qcfg, forward_loop)
+calibration_loop = None if args.post_quant_smoke else forward_loop
+model = mtq.quantize(model, qcfg, calibration_loop)
+if args.post_quant_smoke:
+    post_quant_smoke(model)
 print(f"{'='*60}")
 
 if args.save_quantiles:
@@ -1166,7 +1212,9 @@ else:
 
     print("\nExporting quantized model to HF format...")
     prepare_fn = loader.prepare_export if loader is not None else None
+    source_dir = loader.snapshot_dir if loader is not None else None
     export_hf(model, export_dir=args.export_dir, prepare_fn=prepare_fn,
               extra_mtp_prefixes=cfg.extra_mtp_prefixes,
-              preserve_remote_code=cfg.preserve_remote_code)
+              preserve_remote_code=cfg.preserve_remote_code,
+              source_dir=source_dir)
     print(f"Quantized model exported to {args.export_dir}")

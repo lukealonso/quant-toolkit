@@ -1,0 +1,14 @@
+# ModelOpt 0.46 NVFP4 uses dynamic block scales. One sealed fit window is
+# retained as a transformed-model forward smoke; the full fit and
+# conditional-fit panels feed the separate routed weight optimizer.
+
+[calibration]
+method = "max"
+
+[[dataset]]
+path = "panel.json"
+format = "token_panel"
+role = "fit"
+max_len = 2048
+limit = 1
+batch_size = 1

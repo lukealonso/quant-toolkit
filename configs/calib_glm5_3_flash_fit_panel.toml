@@ -1,0 +1,12 @@
+# Exact role-separated GLM-5.3 calibration. Point --data-dir at panel-v1.
+
+[calibration]
+method = "quantile"
+quantiles = [0.99, 0.999, 0.9999, 0.99999]
+
+[[dataset]]
+path = "panel.json"
+format = "token_panel"
+role = "fit"
+max_len = 2048
+limit = 384

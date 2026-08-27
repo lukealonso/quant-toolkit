@@ -1,6 +1,7 @@
 from .glm5 import Glm5Config
 from .glm5_1 import Glm51Config
 from .glm5_2 import Glm52Config
+from .glm5_3_flash import Glm53FlashConfig
 from .mimo_v25 import MimoV25Config
 from .minimax_m25 import MinimaxM25Config
 from .minimax_m27 import MinimaxM27Config
@@ -13,6 +14,7 @@ _CONFIGS = {
     "glm5": Glm5Config,
     "glm5_1": Glm51Config,
     "glm5_2": Glm52Config,
+    "glm5_3_flash": Glm53FlashConfig,
     "mimo_v25": MimoV25Config,
     "minimax_m25": MinimaxM25Config,
     "minimax_m27": MinimaxM27Config,

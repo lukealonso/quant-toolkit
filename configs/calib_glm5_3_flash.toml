@@ -1,0 +1,20 @@
+# Conservative first-pass calibration for GLM-5.3-Flash routed experts.
+
+[calibration]
+method = "quantile"
+quantiles = [0.99, 0.999, 0.9999, 0.99999]
+
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 1024
+limit = 4096
+
+[[dataset]]
+path = "text/diverse_calib.jsonl"
+max_len = 1024
+limit = 4096
+
+[[dataset]]
+path = "text/deep_calib.jsonl"
+max_len = 8192
+limit = 256

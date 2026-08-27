@@ -214,6 +214,7 @@ def export_hf(
     prepare_fn: Any | None = None,
     extra_mtp_prefixes: list[str] | None = None,
     preserve_remote_code: bool = False,
+    source_dir: str | Path | None = None,
 ) -> None:
     """Export a quantized HF model to safetensors, streaming one layer at a time.
 
@@ -229,6 +230,7 @@ def export_hf(
     """
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = _resolve_source_dir(model, source_dir)
 
     if dtype is None:
         dtype = model.config.torch_dtype
@@ -340,7 +342,7 @@ def export_hf(
 
     # Merge MTP (multi-token prediction) weights from source checkpoint if present.
     shard_idx, total_tensors = _merge_mtp_weights(
-        model, export_dir, weight_map, shard_idx, total_tensors,
+        source_dir, export_dir, weight_map, shard_idx, total_tensors,
         extra_prefixes=extra_mtp_prefixes or [],
     )
 
@@ -353,13 +355,41 @@ def export_hf(
     _rename_shards(export_dir, weight_map, total_shards)
 
     # --- Save config, tokenizer, and quant metadata ---
-    _save_model_metadata(model, export_dir, hf_quant_config, preserve_remote_code=preserve_remote_code)
+    _save_model_metadata(
+        model,
+        export_dir,
+        hf_quant_config,
+        preserve_remote_code=preserve_remote_code,
+        source_dir=source_dir,
+    )
 
     print(f"Export complete. Saved to: {export_dir}")
 
 
+def _resolve_source_dir(model: nn.Module, source_dir: str | Path | None) -> Path:
+    if source_dir is not None:
+        resolved = Path(source_dir).resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"Model source directory does not exist: {resolved}")
+        return resolved
+
+    name_or_path = model.config._name_or_path
+    if Path(name_or_path).is_dir():
+        return Path(name_or_path).resolve()
+
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            name_or_path,
+            allow_patterns=["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model"],
+            local_files_only=True,
+        )
+    )
+
+
 def _merge_mtp_weights(
-    model: nn.Module,
+    source_dir: Path,
     export_dir: Path,
     weight_map: dict[str, str],
     shard_idx: int,
@@ -373,16 +403,6 @@ def _merge_mtp_weights(
     (e.g. GLM-5 uses model.layers.78. for its next-token prediction head).
     """
     from safetensors.torch import load_file
-
-    name_or_path = model.config._name_or_path
-    if Path(name_or_path).is_dir():
-        source_dir = Path(name_or_path)
-    else:
-        from huggingface_hub import snapshot_download
-        source_dir = Path(snapshot_download(
-            name_or_path, allow_patterns=["*.safetensors", "*.json"],
-            local_files_only=True,
-        ))
 
     src_index_path = source_dir / "model.safetensors.index.json"
     if not src_index_path.exists():
@@ -415,8 +435,16 @@ def _merge_mtp_weights(
                 total_tensors += 1
 
     if mtp_shard:
-        shard_idx = _flush_shard(mtp_shard, shard_idx, export_dir, weight_map)
-        print(f"  Wrote {len(mtp_shard)} MTP tensors ({mtp_size / 1e9:.2f} GB)")
+        mtp_path = export_dir / MTP_SHARD_NAME
+        if mtp_path.exists():
+            raise FileExistsError(f"Refusing to overwrite existing MTP shard: {mtp_path}")
+        save_file(mtp_shard, str(mtp_path))
+        for key in mtp_shard:
+            weight_map[key] = MTP_SHARD_NAME
+        print(
+            f"  Wrote {MTP_SHARD_NAME}: {len(mtp_shard)} tensors "
+            f"({mtp_size / 1e9:.2f} GB)"
+        )
         mtp_shard.clear()
 
     return shard_idx, total_tensors
@@ -512,6 +540,7 @@ def _save_model_metadata(
     export_dir: Path,
     hf_quant_config: dict | None,
     preserve_remote_code: bool = False,
+    source_dir: Path | None = None,
 ) -> None:
     """Save config.json (with quantization_config), generation_config, and tokenizer files."""
     # Save config.json from the model's config object.
@@ -547,24 +576,13 @@ def _save_model_metadata(
 
     # Copy tokenizer and chat template files from the source model.
     import shutil
-    name_or_path = model.config._name_or_path
-    if Path(name_or_path).is_dir():
-        source_dir = Path(name_or_path)
-    else:
-        from huggingface_hub import snapshot_download
-        allow_patterns = ["*.json", "*.jinja", "*.txt", "*.model"]
-        if preserve_remote_code:
-            allow_patterns.extend(["*.py", "audio_tokenizer/*"])
-        source_dir = Path(snapshot_download(
-            name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=None if preserve_remote_code else ["*.safetensors"],
-            local_files_only=True,
-        ))
+    if source_dir is None:
+        source_dir = _resolve_source_dir(model, None)
     copy_patterns = [
         "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
         "special_tokens_map.json", "tokenizer.model", "added_tokens.json",
-        "preprocessor_config.json", "video_preprocessor_config.json",
+        "processor_config.json", "preprocessor_config.json",
+        "video_preprocessor_config.json",
         "merges.txt", "vocab.json",
     ]
     if preserve_remote_code:

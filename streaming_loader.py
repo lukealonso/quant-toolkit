@@ -122,6 +122,21 @@ def _checkpoint_key_to_model_key(key: str) -> str:
     key = key.replace(".self_attn.index_q_norm.", ".self_attn.indexer.q_norm.")
     key = key.replace(".self_attn.index_k_norm.", ".self_attn.indexer.k_norm.")
 
+    # GLM-5.3 (transformers model_type=glm5_next) checkpoint conversions.
+    # Keep these byte-for-byte equivalent to the pinned Transformers
+    # conversion_mapping.py rules. The streaming loader bypasses
+    # from_pretrained(), so otherwise these tensors remain on meta.
+    key = re.sub(r"\.self_attn\.f_a_proj\.", ".self_attn.forget_gate.f_a_proj.", key)
+    key = re.sub(r"\.self_attn\.f_b_proj\.", ".self_attn.forget_gate.f_b_proj.", key)
+    key = re.sub(r"\.self_attn\.dt_bias$", ".self_attn.forget_gate.dt_bias", key)
+    key = re.sub(r"\.self_attn\.A_log$", ".self_attn.forget_gate.A_log", key)
+    key = re.sub(r"\.hc_attn_fn$", ".attn_hc.fn", key)
+    key = re.sub(r"\.hc_attn_base$", ".attn_hc.base", key)
+    key = re.sub(r"\.hc_attn_scale$", ".attn_hc.scale", key)
+    key = re.sub(r"\.hc_ffn_fn$", ".ffn_hc.fn", key)
+    key = re.sub(r"\.hc_ffn_base$", ".ffn_hc.base", key)
+    key = re.sub(r"\.hc_ffn_scale$", ".ffn_hc.scale", key)
+
     key = re.sub(r"\.mlp\.experts\.(\d+)\.w1\.weight$", r".mlp.experts.\1.gate_proj.weight", key)
     key = re.sub(r"\.mlp\.experts\.(\d+)\.w3\.weight$", r".mlp.experts.\1.up_proj.weight", key)
     key = re.sub(r"\.mlp\.experts\.(\d+)\.w2\.weight$", r".mlp.experts.\1.down_proj.weight", key)
@@ -135,6 +150,14 @@ def _dense_gate_up_target_key(key: str) -> tuple[str, str] | None:
         return None
     part = "gate" if m.group(2) == "gate_proj" else "up"
     return f"{m.group(1)}.gate_up_proj.weight", part
+
+
+def _glm5_next_conv_target_key(key: str) -> tuple[str, str] | None:
+    """Return the fused GLM-5.3 conv1d target and q/k/v source part."""
+    m = re.match(r"^(.*\.self_attn)\.([qkv])_conv1d\.weight$", key)
+    if not m:
+        return None
+    return f"{m.group(1)}.conv1d.weight", m.group(2)
 
 
 def _expert_first_to_projection_first_key(key: str) -> str | None:
@@ -719,6 +742,7 @@ class StreamingModelLoader:
         )
         regular_entries = []
         dense_gate_up_groups = defaultdict(dict)
+        glm_conv_groups = defaultdict(dict)
         # expert_groups[prefix] = {expert_idx: {proj_name: checkpoint_key}}
         expert_groups = defaultdict(lambda: defaultdict(dict))
 
@@ -730,6 +754,13 @@ class StreamingModelLoader:
                 target_key, part = dense_gate_up
                 if target_key in model_keys:
                     dense_gate_up_groups[target_key][part] = raw_key
+                    continue
+
+            glm_conv = _glm5_next_conv_target_key(key)
+            if glm_conv is not None:
+                target_key, part = glm_conv
+                if target_key in model_keys:
+                    glm_conv_groups[target_key][part] = raw_key
                     continue
 
             m = expert_pattern.match(key)
@@ -765,7 +796,11 @@ class StreamingModelLoader:
                         tensor = f.get_tensor(raw_key)
                         target_device = target_device_for(model_key)
                         set_module_tensor_to_device(
-                            model, model_key, target_device, value=tensor
+                            model,
+                            model_key,
+                            target_device,
+                            value=tensor,
+                            dtype=tensor.dtype,
                         )
 
         # Fuse dense MiniMax M3 gate/up weights into gate_up_proj.
@@ -789,8 +824,34 @@ class StreamingModelLoader:
                 target_key,
                 target_device,
                 value=gate_up,
+                dtype=gate_up.dtype,
             )
             del gate, up, gate_up, tensors
+
+        # Fuse GLM-5.3 KDA q/k/v depthwise convolution weights in the same
+        # q,k,v order used by Transformers' authoritative conversion mapping.
+        for target_key, parts in glm_conv_groups.items():
+            if set(parts) != {"q", "k", "v"}:
+                raise RuntimeError(
+                    f"Missing GLM-5.3 q/k/v conv source weight for {target_key}: "
+                    f"{sorted(parts)}"
+                )
+            tensors = _load_checkpoint_tensors(
+                self.snapshot_dir,
+                self.weight_map,
+                [parts[part] for part in ("q", "k", "v")],
+                "cpu",
+            )
+            fused = torch.cat([tensors[parts[part]] for part in ("q", "k", "v")], dim=0)
+            target_device = target_device_for(target_key)
+            set_module_tensor_to_device(
+                model,
+                target_key,
+                target_device,
+                value=fused,
+                dtype=fused.dtype,
+            )
+            del fused, tensors
 
         # Fuse per-expert keys into 3D parameters.
         # Always fuse on CPU to avoid massive temporary GPU memory spikes —
@@ -835,7 +896,11 @@ class StreamingModelLoader:
             gate_up_key = f"{prefix}.gate_up_proj"
             gate_up_device = target_device_for(gate_up_key)
             set_module_tensor_to_device(
-                model, gate_up_key, gate_up_device, value=gate_up
+                model,
+                gate_up_key,
+                gate_up_device,
+                value=gate_up,
+                dtype=gate_up.dtype,
             )
             del gate_up
 
@@ -845,7 +910,11 @@ class StreamingModelLoader:
             down_key = f"{prefix}.down_proj"
             down_device = target_device_for(down_key)
             set_module_tensor_to_device(
-                model, down_key, down_device, value=down_stacked
+                model,
+                down_key,
+                down_device,
+                value=down_stacked,
+                dtype=down_stacked.dtype,
             )
             del down_stacked
             gc.collect()
@@ -928,6 +997,7 @@ class StreamingModelLoader:
         """Load a meta layer's weights for export (to CPU, with expert unfusing)."""
         del model
         self._materialize_layer_module(module, layer_idx, "cpu")
+        _calibrate_meta_weight_amaxes(module)
 
     def _materialize_layer_module(self, module, layer_idx, device):
         """Load one decoder layer into an already-created module tree."""
@@ -938,6 +1008,7 @@ class StreamingModelLoader:
 
         regular_entries = []
         dense_gate_up_groups = defaultdict(dict)
+        glm_conv_groups = defaultdict(dict)
 
         for raw_key in keys:
             model_key = _checkpoint_key_to_model_key(raw_key)
@@ -951,6 +1022,15 @@ class StreamingModelLoader:
                     target_relative = target_key[len(model_prefix):]
                     if target_relative in module_keys:
                         dense_gate_up_groups[target_relative][part] = raw_key
+                        continue
+
+            glm_conv = _glm5_next_conv_target_key(model_key)
+            if glm_conv is not None:
+                target_key, part = glm_conv
+                if target_key.startswith(model_prefix):
+                    target_relative = target_key[len(model_prefix):]
+                    if target_relative in module_keys:
+                        glm_conv_groups[target_relative][part] = raw_key
                         continue
 
             relative = model_key[len(model_prefix):]
@@ -992,6 +1072,22 @@ class StreamingModelLoader:
             gate_up = torch.cat([tensors[parts["gate"]], tensors[parts["up"]]], dim=0)
             _assign_tensor_to_module(module, target_relative, gate_up, device)
             del gate_up, tensors
+
+        for target_relative, parts in glm_conv_groups.items():
+            if set(parts) != {"q", "k", "v"}:
+                raise RuntimeError(
+                    f"Missing GLM-5.3 q/k/v conv source weight for {target_relative}: "
+                    f"{sorted(parts)}"
+                )
+            tensors = _load_checkpoint_tensors(
+                self.snapshot_dir,
+                self.weight_map,
+                [parts[part] for part in ("q", "k", "v")],
+                device,
+            )
+            fused = torch.cat([tensors[parts[part]] for part in ("q", "k", "v")], dim=0)
+            _assign_tensor_to_module(module, target_relative, fused, device)
+            del fused, tensors
 
     def _get_model_state_keys(self, model):
         if self._model_state_keys is None:
@@ -1139,6 +1235,50 @@ def _init_rotary_buffer(module, buffer_name, device):
     return None
 
 
+def _calibrate_meta_weight_amaxes(module):
+    """Recompute weight amaxes that ModelOpt initialized from meta weights.
+
+    Disk-backed layers are still meta when ModelOpt runs its global weight-only
+    calibration pass.  Once their immutable weights are materialized, replace
+    those placeholder amaxes using the same max-calibration routine ModelOpt
+    uses for ordinary resident weights.
+    """
+    from modelopt.torch.quantization.model_calib import max_calibrate
+    from modelopt.torch.quantization.nn import TensorQuantizer
+
+    calibrated = 0
+    for child in module.modules():
+        quantizer = getattr(child, "weight_quantizer", None)
+        weight = getattr(child, "weight", None)
+        if not isinstance(quantizer, TensorQuantizer) or not quantizer.is_enabled:
+            continue
+        amax = getattr(quantizer, "_amax", None)
+        if not isinstance(amax, torch.Tensor) or amax.device.type != "meta":
+            continue
+        if not isinstance(weight, torch.Tensor) or weight.device.type == "meta":
+            raise RuntimeError(
+                "Cannot calibrate a lazy weight amax without materialized weight data"
+            )
+        calibrator = getattr(quantizer, "_calibrator", None)
+        if calibrator is None or not hasattr(calibrator, "reset"):
+            raise RuntimeError("Lazy weight amax requires a resettable ModelOpt calibrator")
+        calibrator.reset()
+        # TensorQuantizer's setter copies into an existing buffer.  A copy into
+        # a meta buffer remains meta, so unregister the placeholder first and
+        # let load_calib_amax create a real buffer on the weight device.
+        delattr(quantizer, "_amax")
+        max_calibrate(
+            quantizer,
+            lambda current, value=weight: current(value),
+            distributed_sync=False,
+        )
+        resolved = getattr(quantizer, "_amax", None)
+        if not isinstance(resolved, torch.Tensor) or resolved.device.type == "meta":
+            raise RuntimeError("Lazy weight amax remained meta after calibration")
+        calibrated += 1
+    return calibrated
+
+
 class LayerStreamingHook:
     """Forward hooks that stream a decoder layer's weights to GPU 0 for execution."""
 
@@ -1151,6 +1291,12 @@ class LayerStreamingHook:
         """Copy or load layer weights to GPU 0 before forward pass."""
         if self.storage_device == "meta":
             self._load_from_disk(module)
+            calibrated = _calibrate_meta_weight_amaxes(module)
+            if calibrated:
+                print(
+                    f"  Layer {self.layer_idx}: calibrated {calibrated} "
+                    "lazy weight amax(es)"
+                )
             # _load_from_disk only loads checkpoint weights. After mtq.quantize
             # attaches TensorQuantizer modules, their buffers (_amax, _pre_quant_scale,
             # etc.) live on CPU (preserved there by _unload_to_meta). We need to

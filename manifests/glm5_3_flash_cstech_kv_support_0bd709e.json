@@ -1,0 +1,138 @@
+{
+  "schema": "quant-toolkit.glm53-kv-policy-support.v1",
+  "recorded_date": "2026-08-26",
+  "runtime": {
+    "image": "cstechdev/vllm@sha256:0bd709e80b8ff13ae5de8f7d7f708a499fade3a26970d56afb1be2ff3860fde5",
+    "image_id": "sha256:0bd709e80b8ff13ae5de8f7d7f708a499fade3a26970d56afb1be2ff3860fde5",
+    "vllm_version": "0.1.dev20051+g487ecf187",
+    "selected_backend": "FLASHINFER_MLA_SPARSE_SM120"
+  },
+  "model": {
+    "repo": "zai-org/GLM-5.3-Flash-BF16",
+    "revision": "b1967181a3917ae70a437f4884748f6b8e3a1f4d",
+    "config_sha256": "33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f943",
+    "hidden_size": 4096,
+    "vocab_size": 154880,
+    "num_hidden_layers": 45,
+    "qk_rope_head_dim": 0,
+    "qk_nope_head_dim": 256,
+    "kv_lora_rank": 512,
+    "rope_path_exists": false
+  },
+  "parser_accepted_cache_dtypes": [
+    "auto",
+    "float16",
+    "bfloat16",
+    "fp8",
+    "fp8_e4m3",
+    "fp8_e5m2",
+    "fp8_inc",
+    "fp8_ds_mla",
+    "turboquant_k8v4",
+    "turboquant_4bit_nc",
+    "turboquant_k3v4_nc",
+    "turboquant_3bit_nc",
+    "int4_per_token_head",
+    "int8_per_token_head",
+    "fp8_per_token_head",
+    "nvfp4",
+    "nvfp4_4over6"
+  ],
+  "selected_backend_accepted_cache_dtypes": [
+    "fp8_ds_mla"
+  ],
+  "selected_backend_aliases": {
+    "auto": "fp8_ds_mla",
+    "fp8": "fp8_ds_mla",
+    "fp8_e4m3": "fp8_ds_mla"
+  },
+  "effective_layout": {
+    "name": "fp8_ds_mla",
+    "torch_storage_dtype": "uint8",
+    "bytes_per_token": 656,
+    "nope_latent": {
+      "values": 512,
+      "value_format": "FP8",
+      "value_bytes": 512
+    },
+    "scales": {
+      "groups": 4,
+      "values_per_group": 128,
+      "scale_format": "FP32",
+      "scale_bytes": 16
+    },
+    "rope_region": {
+      "model_values": 0,
+      "padded_values": 64,
+      "padded_format": "BF16",
+      "padded_bytes": 128,
+      "contains_model_rope_state": false
+    }
+  },
+  "intended_policies": [
+    {
+      "id": "A",
+      "intent": "BF16 KV throughout",
+      "candidate_flags": [
+        "--kv-cache-dtype bfloat16",
+        "--kv-cache-dtype auto"
+      ],
+      "status": "unsupported",
+      "reason": "Explicit bfloat16 is rejected by FLASHINFER_MLA_SPARSE_SM120. auto is canonicalized to fp8_ds_mla and therefore is not BF16 KV."
+    },
+    {
+      "id": "B",
+      "intent": "BF16 RoPE-path KV plus FP8 lower-precision non-RoPE KV",
+      "candidate_flags": [
+        "--kv-cache-dtype fp8",
+        "--kv-cache-dtype fp8_e4m3",
+        "--kv-cache-dtype fp8_ds_mla"
+      ],
+      "status": "supported_with_no_rope_correction",
+      "effective_flag": "--kv-cache-dtype fp8",
+      "effective_dtype": "fp8_ds_mla",
+      "reason": "GLM-5.3 has qk_rope_head_dim=0. The 128-byte BF16 region is padding for the 576-wide kernel geometry, not a model RoPE path; the real 512-wide NoPE latent is FP8 with four FP32 scales."
+    },
+    {
+      "id": "C",
+      "intent": "FP8 RoPE-path KV plus NVFP4 lower-precision non-RoPE KV",
+      "candidate_flags": [
+        "--kv-cache-dtype nvfp4",
+        "--kv-cache-dtype nvfp4_4over6"
+      ],
+      "status": "unsupported",
+      "reason": "The generic FlashInfer backend advertises NVFP4, but the selected GLM sparse SM120 backend rejects every layout except fp8_ds_mla. nvfp4_4over6 is a whole-layout scaling codec, not a mixed RoPE/NoPE layout."
+    }
+  ],
+  "source_evidence": [
+    {
+      "path": "/usr/local/lib/python3.12/dist-packages/vllm/config/cache.py",
+      "sha256": "8790351601be188ed1cc7ad9de2af1978b238269da4724873af1185c91165ef6",
+      "evidence": "Global parser CacheDType choices and nvfp4_4over6 scaling semantics."
+    },
+    {
+      "path": "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/attention/mla_attention.py",
+      "sha256": "a309ca752b01e85360b268fba56245b816ff245340e9e361166ee96b99d93a94",
+      "evidence": "auto/fp8/fp8_e4m3 canonicalization to fp8_ds_mla for the SM120 backend."
+    },
+    {
+      "path": "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py",
+      "sha256": "d665ef2109b0183d48e3541ecd24e9fa8e1dc3e410983bc29b8d997af9d7cd01",
+      "evidence": "Hard requirement for fp8_ds_mla and 64-value RoPE padding when qk_rope_head_dim is zero."
+    },
+    {
+      "path": "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py",
+      "sha256": "13834fa765e997d41f3955182e48e98555893b203c05d25341da62669e7f1b5c",
+      "evidence": "656-byte shape: 512 NoPE bytes, 16 scale bytes, and 128 padded RoPE bytes."
+    },
+    {
+      "path": "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/flashinfer.py",
+      "sha256": "4a41a001a706f15e13ce992114e8c7a20f4a8a4a338c7a83d81c6ac6def4134d",
+      "evidence": "NVFP4 is advertised only by the generic FlashInfer backend, not the selected sparse MLA SM120 backend."
+    }
+  ],
+  "runtime_confirmation": {
+    "launch_flag": "--kv-cache-dtype fp8",
+    "startup_log": "Using fp8_ds_mla KV cache format for FLASHINFER_MLA_SPARSE_SM120 backend."
+  }
+}

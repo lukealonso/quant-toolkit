@@ -4,7 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.0",
+    "datasets>=3.0",
     "nvidia-modelopt[torch] @ git+https://github.com/NVIDIA/TensorRT-Model-Optimizer.git",
+    "numpy>=2.0",
     "pillow",
     "protobuf",
     "requests",
@@ -12,7 +14,9 @@ dependencies = [
     "sentencepiece",
     "torch>=2.10",
     "torchvision",
-    "transformers>=5.12.0",
+    # GLM-5.3-Flash landed after the latest Transformers release. Pin the
+    # upstream merge until a tagged release contains glm5_next.
+    "transformers @ git+https://github.com/huggingface/transformers.git@eb4d9e2a64a013bec12289288b85d0b1210ba0aa",
 ]
 
 [tool.uv]
